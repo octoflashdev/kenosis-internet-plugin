@@ -114,3 +114,121 @@ class WebViewLoadFailureTest {
         assertTrue(WebViewPageFetcher.loadFailureReason(null, null) != null)
     }
 }
+
+/**
+ * Boundary tests for [WebViewPageFetcher.errorPageReason] — the CONTENT-level
+ * backstop behind [WebViewPageFetcher.loadFailureReason].
+ *
+ * 2026-10-03 on-device regression this pins: a share-URL analyse saved a
+ * library document titled "Web page not available" (a 717-byte .txt) — the
+ * WebView's own error page was extracted and returned as a SUCCESSFUL fetch
+ * even though [loadFailureReason] shipped in that build (the error page
+ * rendered on a navigation where no main-frame error callback was captured).
+ * An extract carrying the error page's deterministic title/body signature
+ * must FAIL, never serve.
+ */
+class WebViewErrorPageReasonTest {
+
+    // ---------------- content (null = extractable) ----------------
+
+    @Test
+    fun `a real page title and body are extractable`() {
+        assertNull(
+            WebViewPageFetcher.errorPageReason(
+                "Yr - Zagreb - Long term forecast",
+                "Skip to content A collaboration between NRK and The Norwegian " +
+                    "Meteorological Institute Zagreb Capital, City of Zagreb " +
+                    "(Croatia), elevation 138 m …",
+            ),
+        )
+    }
+
+    @Test
+    fun `a long article quoting net err early is still extractable`() {
+        // Over the 600-char scope on purpose: the body signature only refuses
+        // SHORT extracts (error pages are tiny); a long article that leads
+        // with a quoted net:: code is real content.
+        assertNull(
+            WebViewPageFetcher.errorPageReason(
+                "Debugging Android WebView loads",
+                "The most common failure is net::ERR_NAME_NOT_RESOLVED, which " +
+                    "means DNS died. This article walks through fifteen more " +
+                    "codes and how to read the Chrome://net-export trace you " +
+                    "captured alongside the logcat output from the device. " +
+                    "We start with DNS provisioning, move through captive " +
+                    "portal detection, then look at the WebView client " +
+                    "callbacks in the order the framework fires them, and " +
+                    "finish with the rendering pipeline: first paint, the " +
+                    "AJAX settle window, and the extraction deadline that " +
+                    "bounds how long a blank challenge shell may keep the " +
+                    "fetcher waiting before the attempt is abandoned. With " +
+                    "those mechanics pinned down, every signature this " +
+                    "guard could ever mistake for an error page becomes " +
+                    "obviously content instead.",
+            ),
+        )
+    }
+
+    // ---------------- title signatures ----------------
+
+    @Test
+    fun `legacy chromium title fails (the 2026-10-03 on-device spelling)`() {
+        val reason = WebViewPageFetcher.errorPageReason(
+            "Web page not available",
+            "Web page not available net::ERR_ADDRESS_UNREACHABLE",
+        )
+        assertTrue(reason != null)
+        assertTrue(
+            "reason should say the browser served its error page: $reason",
+            reason!!.contains("error page"),
+        )
+    }
+
+    @Test
+    fun `current chromium title fails too`() {
+        assertTrue(
+            WebViewPageFetcher.errorPageReason(
+                "Webpage not available",
+                "The webpage at https://dead.example.com/ could not be loaded",
+            ) != null,
+        )
+    }
+
+    @Test
+    fun `title match is case-insensitive and trims whitespace`() {
+        assertTrue(
+            WebViewPageFetcher.errorPageReason(
+                "  WEB PAGE NOT AVAILABLE ",
+                "some body text",
+            ) != null,
+        )
+    }
+
+    // ---------------- body signature (title extraction missed) ----------------
+
+    @Test
+    fun `short body naming net err fails when the title is not canonical`() {
+        val reason = WebViewPageFetcher.errorPageReason(
+            "about:blank",
+            "net::ERR_NAME_NOT_RESOLVED",
+        )
+        assertTrue(reason != null)
+        assertTrue(
+            "reason should name the net:: error page: $reason",
+            reason!!.contains("net:: error"),
+        )
+    }
+
+    @Test
+    fun `a long document naming net err in the body head is extractable`() {
+        // The length scope: error pages are tiny; a LONG extract that happens
+        // to lead with a quoted net:: code is real content.
+        assertNull(
+            WebViewPageFetcher.errorPageReason(
+                "Connectivity troubleshooting log",
+                "net::ERR_TIMED_OUT was the first of 40 failures recorded in " +
+                    "this long field report. " + "Detail line. ".repeat(120),
+            ),
+        )
+    }
+}

@@ -37,13 +37,58 @@ class RenderRetryPolicyTest {
     }
 
     @Test
-    fun `non-blank render does not retry`() {
-        // Content is content — never poll past it.
+    fun `first non-blank render polls once to confirm stability`() {
+        // 2026-10-03 on-device (yr.no daily-table): the first extract was
+        // non-blank but PARTIAL — chrome + current conditions rendered, the
+        // data table hydrated from a later XHR. A first extract carries no
+        // stability evidence — it retries so the next poll can confirm.
+        assertTrue(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "Wind forecast for Split: 12 kn",
+                nowMs = 1000L,
+                deadlineMs = 2000L,
+            )
+        )
+    }
+
+    @Test
+    fun `unchanged consecutive extracts are settled - no retry`() {
+        // Two identical extracts = the DOM stopped filling — complete.
         assertFalse(
             WebViewPageFetcher.shouldRetryExtraction(
                 "Wind forecast for Split: 12 kn",
                 nowMs = 1000L,
                 deadlineMs = 2000L,
+                previousText = "Wind forecast for Split: 12 kn",
+            )
+        )
+    }
+
+    @Test
+    fun `changed extract vs previous poll retries - hydration in progress`() {
+        // The text GREW/changed between polls — the page is still hydrating
+        // (the yr.no table landing between polls). Keep polling.
+        assertTrue(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "Zagreb forecast: today 18°C. Saturday 16, Sunday 14.",
+                nowMs = 1000L,
+                deadlineMs = 2000L,
+                previousText = "Zagreb forecast: today 18°C.",
+            )
+        )
+    }
+
+    @Test
+    fun `non-blank unstable extract at the deadline stops retrying`() {
+        // Deadline reached with content still changing — the CALLER completes
+        // with the latest text (partial real content beats failing); the
+        // gate itself must stop the loop.
+        assertFalse(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "Zagreb forecast: today 18°C. Saturday 16.",
+                nowMs = 2000L,
+                deadlineMs = 2000L,
+                previousText = "Zagreb forecast: today 18°C.",
             )
         )
     }

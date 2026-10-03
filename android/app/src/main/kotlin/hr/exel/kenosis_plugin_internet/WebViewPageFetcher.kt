@@ -115,16 +115,34 @@ class WebViewPageFetcher(context: Context) {
         }
 
         /**
-         * Pure, unit-testable: should the extraction be retried? A BLANK
-         * render before the deadline means the page hasn't produced readable
-         * content yet — typically a bot-wall challenge shell (DataDome's
-         * first paint is script-only; its challenge JS runs, sets the
-         * clearance cookie, and reloads the page with the real payload, all
-         * AFTER the first onPageFinished) — while non-blank text is content
-         * and a passed deadline means it never will be.
+         * Pure, unit-testable: should the extraction be retried?
+         *
+         * A BLANK render before the deadline means the page hasn't produced
+         * readable content yet — typically a bot-wall challenge shell
+         * (DataDome's first paint is script-only; its challenge JS runs, sets
+         * the clearance cookie, and reloads the page with the real payload,
+         * all AFTER the first onPageFinished).
+         *
+         * STABILITY gate (2026-10-03 on-device, yr.no daily-table): the first
+         * non-blank extract can be PARTIAL — chrome renders first, the data
+         * table hydrates from a later XHR — so a first extract (previousText
+         * null) polls once to confirm it settled, and a CHANGED extract vs
+         * the previous poll keeps polling (the DOM is still filling). Two
+         * consecutive identical extracts = settled = no retry. A passed
+         * deadline never retries: blank fails honestly; non-blank-unstable
+         * completes with the latest text at the caller.
          */
-        fun shouldRetryExtraction(text: String, nowMs: Long, deadlineMs: Long): Boolean =
-            text.isBlank() && nowMs < deadlineMs
+        fun shouldRetryExtraction(
+            text: String,
+            nowMs: Long,
+            deadlineMs: Long,
+            previousText: String? = null,
+        ): Boolean {
+            if (nowMs >= deadlineMs) return false
+            if (text.isBlank()) return true
+            if (previousText == null) return true
+            return text != previousText
+        }
 
         /**
          * Pure, unit-testable: given the page URL reported at onPageFinished
@@ -152,6 +170,42 @@ class WebViewPageFetcher(context: Context) {
             if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
                 return "the page redirected to a non-web link ($pageUrl) " +
                     "that the in-app browser cannot read"
+            }
+            return null
+        }
+
+        /**
+         * Pure, unit-testable: is this EXTRACTED page actually the WebView's
+         * built-in error screen that slipped past [loadFailureReason]?
+         *
+         * Why this exists — 2026-10-03 on-device: a share-URL analyse saved a
+         * library document titled "Web page not available" (717-byte .txt) —
+         * the WebView's own error page got extracted and returned as a
+         * successful fetch despite the [loadFailureReason] guard being
+         * present in that build (the error page rendered on a navigation
+         * where no main-frame [onReceivedError]/[onReceivedHttpError] was
+         * captured). Content-level backstop: the error page has a
+         * deterministic title (both spellings — this device's WebView uses
+         * the LEGACY "Web page not available", current Chromium says
+         * "Webpage not available") and a short body naming the `net::ERR_…`
+         * code. Real content never carries either signature; failing here
+         * turns a garbage document into an honest fetch error the host
+         * already relays ("could not access the page").
+         *
+         * The net::ERR_ text check is scoped to SHORT extracts (< 600 chars —
+         * error pages are tiny) so an article QUOTING a net:: code early is
+         * never refused.
+         */
+        fun errorPageReason(title: String, text: String): String? {
+            val t = title.lowercase().trim()
+            if (t == "webpage not available" || t == "web page not available") {
+                return "the page could not be loaded (the browser served its " +
+                    "error page)"
+            }
+            val head = text.trim().take(200).lowercase()
+            if (head.contains("net::err_") && text.trim().length < 600) {
+                return "the page could not be loaded (browser error page " +
+                    "naming a net:: error)"
             }
             return null
         }
@@ -492,7 +546,8 @@ class WebViewPageFetcher(context: Context) {
     }
 
     /**
-     * Extract the rendered text, retrying while the page renders BLANK.
+     * Extract the rendered text, retrying while the page renders BLANK or is
+     * STILL HYDRATING.
      *
      * A blank render before the deadline is usually a bot-wall challenge
      * shell — DataDome's first paint (Qwant SERP, +73 live test) is
@@ -500,9 +555,18 @@ class WebViewPageFetcher(context: Context) {
      * the clearance cookie and RELOADS the page with the real payload, all
      * after our first onPageFinished — or a very slow SPA still hydrating.
      * Every attempt reads the LIVE DOM, so a reload that lands between
-     * attempts is captured by the next one. Only non-blank text completes
-     * the fetch; blank past the deadline fails with the honest reason
-     * instead of completing with an empty observation.
+     * attempts is captured by the next one.
+     *
+     * Progressive hydration (2026-10-03 on-device, yr.no daily-table): the
+     * chrome + current-conditions render first, the data table arrives via a
+     * later XHR — the first extract is NON-blank but tableless, and the old
+     * gate completed instantly (the chat answer then invented 0/0/0 "daily
+     * temperatures"). A CHANGED extract vs the previous poll means the DOM
+     * is still filling — keep polling; two consecutive identical extracts
+     * mean settled — complete. The deadline caps the loop, and a non-blank
+     * but still-unstable page at the deadline completes with the LATEST text
+     * (partial content beats failing a page that rendered something real);
+     * only a blank page past the deadline fails with the honest reason.
      */
     private fun <R> extractWithRetry(
         webView: WebView,
@@ -511,6 +575,7 @@ class WebViewPageFetcher(context: Context) {
         finished: AtomicBoolean,
         js: String,
         parser: (JSONObject) -> R,
+        previousText: String? = null,
     ) {
         if (finished.get()) return
         webView.evaluateJavascript(js) { result ->
@@ -533,10 +598,29 @@ class WebViewPageFetcher(context: Context) {
                 completeFetch(webView, future, finished) { it.completeExceptionally(e) }
                 return@evaluateJavascript
             }
-            if (shouldRetryExtraction(text, System.currentTimeMillis(), contentDeadline)) {
-                Log.d(TAG, "FC: [InternetPlugin] webview render blank — retrying in ${EMPTY_RENDER_POLL_MS}ms")
+            if (shouldRetryExtraction(
+                    text,
+                    System.currentTimeMillis(),
+                    contentDeadline,
+                    previousText,
+                )
+            ) {
+                val why =
+                    if (text.isBlank()) "render blank" else "text still changing (hydration)"
+                Log.d(
+                    TAG,
+                    "FC: [InternetPlugin] webview $why — retrying in ${EMPTY_RENDER_POLL_MS}ms",
+                )
                 handler.postDelayed({
-                    extractWithRetry(webView, contentDeadline, future, finished, js, parser)
+                    extractWithRetry(
+                        webView,
+                        contentDeadline,
+                        future,
+                        finished,
+                        js,
+                        parser,
+                        previousText = text,
+                    )
                 }, EMPTY_RENDER_POLL_MS)
                 return@evaluateJavascript
             }
@@ -547,6 +631,18 @@ class WebViewPageFetcher(context: Context) {
                     it.completeExceptionally(
                         IllegalStateException("the page rendered no readable content"),
                     )
+                }
+                return@evaluateJavascript
+            }
+            // Error-page content backstop (see [errorPageReason]): the
+            // guard above only sees navigation events; an error page that
+            // rendered without a captured main-frame error is refused HERE,
+            // by its own title/body signature, never served as content.
+            val errReason = errorPageReason(json.optString("title", ""), text)
+            if (errReason != null) {
+                Log.w(TAG, "FC: [InternetPlugin] webview error-page extract blocked: $errReason")
+                completeFetch(webView, future, finished) {
+                    it.completeExceptionally(IllegalStateException(errReason))
                 }
                 return@evaluateJavascript
             }

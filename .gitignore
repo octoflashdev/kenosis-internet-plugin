@@ -44,5 +44,8 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# build_debug.sh build-stamp: repo HEAD the last built APK came from
+/.built-sha
+
 # Release APK — distributed as a GitHub Release asset, never committed
 /kenosis-internet-search-plugin.apk
