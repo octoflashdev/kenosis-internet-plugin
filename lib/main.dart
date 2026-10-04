@@ -402,61 +402,84 @@ class _StatusScreenState extends State<StatusScreen> {
                   _captcha = null;
                 }),
               ),
-            // ---- Status header ----
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-              child: Column(
-                children: [
-                  Icon(Icons.public, size: 48, color: scheme.primary),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Kenosis AI - Internet Search plugin',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    _captcha != null ? 'Status: human check needed' : 'Status: ready',
-                    style: TextStyle(fontSize: 14, color: scheme.onSurfaceVariant),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Open Kenosis AI, tap the plugin badge in the chat and attach '
-                    'this plugin to let its offline model fetch web pages on '
-                    'demand. Tap any entry for details.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            // ---- URL log ----
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  'Requested URLs (${_fetchLog.length})',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ),
-            ),
+            // ---- One scrolling surface (split-view fix) ----
+            // Status header + label + rows scroll TOGETHER: the previously
+            // pinned ~230 px of header chrome starved the URL list down to a
+            // sliver in half-height split-view windows. The human-check
+            // banner above stays PINNED — actionable, never scrolled away.
             Expanded(
-              child: _fetchLog.isEmpty
-                  ? Center(
-                      child: Text(
-                        'No URLs requested yet.',
-                        style: TextStyle(color: scheme.onSurfaceVariant),
+              child: CustomScrollView(
+                slivers: [
+                  // ---- Status header ----
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 24, vertical: 16),
+                      child: Column(
+                        children: [
+                          Icon(Icons.public, size: 48, color: scheme.primary),
+                          const SizedBox(height: 12),
+                          const Text(
+                            'Kenosis AI - Internet Search plugin',
+                            style: TextStyle(
+                                fontSize: 16, fontWeight: FontWeight.bold),
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            _captcha != null
+                                ? 'Status: human check needed'
+                                : 'Status: ready',
+                            style: TextStyle(
+                                fontSize: 14,
+                                color: scheme.onSurfaceVariant),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            'Open Kenosis AI, tap the plugin badge in the chat and attach '
+                            'this plugin to let its offline model fetch web pages on '
+                            'demand. Tap any entry for details.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                fontSize: 13, color: scheme.onSurfaceVariant),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SliverToBoxAdapter(child: Divider(height: 1)),
+                  // ---- URL log ----
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Requested URLs (${_fetchLog.length})',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_fetchLog.isEmpty)
+                    SliverFillRemaining(
+                      hasScrollBody: false,
+                      child: Center(
+                        child: Text(
+                          'No URLs requested yet.',
+                          style: TextStyle(color: scheme.onSurfaceVariant),
+                        ),
                       ),
                     )
-                  : ListView.builder(
-                      itemCount: _fetchLog.length,
+                  else
+                    SliverPadding(
                       padding: const EdgeInsets.symmetric(horizontal: 8),
+                      sliver: SliverList.builder(
+                      itemCount: _fetchLog.length,
                       itemBuilder: (context, i) {
                         final r = _fetchLog[i];
                         final isSearch = r['tool'] == 'web_search';
@@ -532,7 +555,10 @@ class _StatusScreenState extends State<StatusScreen> {
                           ],
                         );
                       },
+                      ),
                     ),
+                ],
+              ),
             ),
           ],
         ),
@@ -849,7 +875,10 @@ class _UrlLogSheet extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return SizedBox(
-      height: 440,
+      // Adaptive (split-view fix): a fixed 440 px sheet overflowed/squeezed
+      // the list in half-height windows — scale with the viewport, capped at
+      // the original design height (unchanged on full-size screens).
+      height: (MediaQuery.sizeOf(context).height * 0.8).clamp(220.0, 440.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

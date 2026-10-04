@@ -465,6 +465,27 @@ void main() {
       expect(find.textContaining('http · 1234 chars'), findsOneWidget);
       expect(find.textContaining('What happened'), findsNothing);
     });
+
+    testWidgets(
+        'split-view (short surface): URL rows scroll into view, no overflow',
+        (tester) async {
+      // Half-height split-view window: the pinned-header layout starved the
+      // list to a sliver. Header + label + rows now share ONE scrollable —
+      // a row must be reachable by scrolling, with no layout exceptions.
+      tester.view.physicalSize = const Size(800, 320);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await pumpScreen(tester);
+      expect(tester.takeException(), isNull);
+      await tester.scrollUntilVisible(
+        find.byIcon(Icons.language),
+        250,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.textContaining('example.com/history'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
   });
 
   group('human-check banner (+75) — the pending gate surfaces as a card', () {
