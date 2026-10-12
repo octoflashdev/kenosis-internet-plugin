@@ -8,7 +8,10 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'legal/legal_document_repository.dart';
 import 'legal/legal_document_repository_impl.dart';
 import 'presentation/views/about_screen.dart';
+import 'presentation/views/browser_settings_screen.dart';
 import 'presentation/views/plugin_drawer.dart';
+import 'presentation/widgets/tab_strip.dart';
+import 'presentation/widgets/tab_viewport.dart';
 import 'presentation/widgets/theme_scope.dart';
 import 'services/external_links_service.dart';
 import 'services/external_links_service_impl.dart';
@@ -50,12 +53,14 @@ String describeFetchError(String status) {
   }
   if (msg.contains('human check')) {
     return 'The search engine wants to verify a human before it serves '
-        'results. Complete the check shown at the top of this app, then '
-        'search again in Kenosis AI.';
+        'results. Open the tab, complete the check, then search again in '
+        'Kenosis AI.';
   }
-  if (msg.contains('bot protection')) {
-    return 'The search engine blocked this device as a possible bot. Try a '
-        'different search engine.';
+  if (msg.contains('needs interaction')) {
+    return 'The page could not be read by the tool — it needs a human '
+        'action (a login wall, a consent gate, or a script-only app). '
+        'Complete the action in the open tab, then ask again in '
+        'Kenosis AI.';
   }
   if (msg.contains('WebView JS extraction returned null')) {
     return 'The page rendered, but its text could not be extracted from it.';
@@ -212,6 +217,15 @@ class _StatusScreenState extends State<StatusScreen> {
   List<Map<String, dynamic>> _fetchLog = const [];
   Timer? _refreshTimer;
 
+  /// Live tab strip (SERP proof + I'm Lucky / fetch tabs). Polled with the
+  /// log — the service opens tabs on binder threads while this screen is up.
+  List<TabInfo> _tabs = const [];
+
+  /// Id of the tab the viewport is currently hosting (hybrid-composition
+  /// platform view). Follows the service's foreground tab unless the user
+  /// explicitly activated another one.
+  int? _hostedTabId;
+
   /// Pending human check from [CaptchaGate] (service side), polled with the
   /// same 2s channel hop as the fetch log. Null = no check pending.
   Map<String, dynamic>? _captcha;
@@ -244,6 +258,67 @@ class _StatusScreenState extends State<StatusScreen> {
   Future<void> _refresh() async {
     await _loadFetchLog();
     await _loadCaptcha();
+    await _loadTabs();
+  }
+
+  Future<void> _loadTabs() async {
+    List<TabInfo> tabs = const [];
+    try {
+      final json = await _channel.invokeMethod<String>('getTabs');
+      if (json != null && json.isNotEmpty) {
+        tabs = (jsonDecode(json) as List)
+            .whereType<Map>()
+            .map((m) => TabInfo.fromJson(m.cast<String, dynamic>()))
+            .toList();
+      }
+    } on PlatformException catch (_) {
+      // Channel not ready — keep the previous strip.
+      return;
+    } on FormatException catch (_) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _tabs = tabs;
+      // Always host the service's foreground tab. The service is the source
+      // of truth (user picks call setActiveTab; the tool moves focus when a
+      // result opens). Sticky-hosting a stale id hid the Lucky handoff —
+      // the empty slot stayed in front while the real page sat behind it.
+      final fg = tabs.where((t) => t.isForeground).toList();
+      _hostedTabId =
+          fg.isNotEmpty ? fg.last.id : (tabs.isEmpty ? null : tabs.last.id);
+    });
+  }
+
+  Future<void> _activateTab(int id) async {
+    try {
+      await _channel.invokeMethod<bool>('setActiveTab', {'id': id});
+    } on PlatformException catch (_) {
+      // Channel down — the 2s poll will reconcile.
+    }
+    if (mounted) {
+      setState(() {
+        _hostedTabId = id;
+        _tabs = [
+          for (final t in _tabs)
+            TabInfo(
+              id: t.id,
+              title: t.title,
+              url: t.url,
+              isForeground: t.id == id,
+            ),
+        ];
+      });
+    }
+  }
+
+  Future<void> _closeTab(int id) async {
+    try {
+      await _channel.invokeMethod<bool>('closeTab', {'id': id});
+    } on PlatformException catch (_) {
+      // Channel down — the 2s poll will reconcile.
+    }
+    await _loadTabs();
   }
 
   Future<void> _loadFetchLog() async {
@@ -356,6 +431,14 @@ class _StatusScreenState extends State<StatusScreen> {
       appBar: AppBar(
         title: const Text('Internet Search plugin'),
         actions: [
+          // Browser settings: Load images / Enable JavaScript / Wipe on close.
+          IconButton(
+            icon: const Icon(Icons.tune),
+            tooltip: 'Browser settings',
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(
+              builder: (_) => const BrowserSettingsScreen(),
+            )),
+          ),
           // Delete-all badge: the requested-URL count over a log icon; the
           // sheet it opens lists every logged URL (selectable) and offers
           // the confirmed wipe. Hidden label when the log is empty.
@@ -402,13 +485,38 @@ class _StatusScreenState extends State<StatusScreen> {
                   _captcha = null;
                 }),
               ),
-            // ---- One scrolling surface (split-view fix) ----
-            // Status header + label + rows scroll TOGETHER: the previously
-            // pinned ~230 px of header chrome starved the URL list down to a
-            // sliver in half-height split-view windows. The human-check
-            // banner above stays PINNED — actionable, never scrolled away.
-            Expanded(
-              child: CustomScrollView(
+            // ---- Live tab surface (mini search-browser) ----
+            // The SAME WebViews the plugin's tools read (WYSIWYG): a SERP
+            // proof tab + the opened page. This IS the body while tabs are
+            // open — the request log stays in the AppBar badge sheet.
+            if (_tabs.isNotEmpty) ...[
+              TabStrip(
+                tabs: _tabs,
+                onActivate: _activateTab,
+                onClose: _closeTab,
+              ),
+              TabUrlBar(
+                url: _tabs
+                    .where((t) => t.id == _hostedTabId)
+                    .map((t) => t.url)
+                    .join(),
+              ),
+              Expanded(
+                child: _hostedTabId == null
+                    ? const SizedBox.shrink()
+                    : TabViewport(
+                        key: ValueKey(_hostedTabId),
+                        tabId: _hostedTabId!,
+                      ),
+              ),
+            ] else
+              // ---- One scrolling surface (split-view fix) ----
+              // Status header + label + rows scroll TOGETHER: the previously
+              // pinned ~230 px of header chrome starved the URL list down to a
+              // sliver in half-height split-view windows. The human-check
+              // banner above stays PINNED — actionable, never scrolled away.
+              Expanded(
+                child: CustomScrollView(
                 slivers: [
                   // ---- Status header ----
                   SliverToBoxAdapter(
@@ -745,18 +853,16 @@ class _CaptchaBanner extends StatelessWidget {
   }
 }
 
-/// Full-screen VISIBLE WebView loaded with the exact blocked SERP URL — where
-/// the user actually completes the bot-wall challenge (DataDome press-and-
-/// hold, DuckDuckGo anomaly check). The system WebView's CookieManager is
-/// process-wide and persisted, so the clearance cookies earned here are the
-/// same cookies the plugin's hidden fetches send afterwards — that is the
-/// whole mechanism (the fast OkHttp path stays fingerprint-blocked on Qwant;
-/// the hidden-WebView SERP retry recovers on the earned cookie).
+/// Full-screen VISIBLE WebView loaded with the exact blocked page URL —
+/// where the user actually completes the bot-wall challenge (DataDome
+/// press-and-hold, DuckDuckGo anomaly check). `captchaSolved` only dismisses
+/// the notification; the model searches again on its own (no cookie-unlock
+/// auto-retry).
 ///
 /// Auto-detects completion by reading the page's text after each navigation:
-/// a real page (or a JSON body, for Qwant's API URL) is long and carries no
-/// challenge markers. The Done button is the manual fallback — the detection
-/// is heuristic and must never trap the user on the screen.
+/// a real page is long and carries no challenge markers. The Done button is
+/// the manual fallback — the detection is heuristic and must never trap the
+/// user on the screen.
 class CaptchaSolveScreen extends StatefulWidget {
   const CaptchaSolveScreen({super.key, required this.engine, required this.url});
 

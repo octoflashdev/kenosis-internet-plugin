@@ -30,10 +30,10 @@ class CaptchaGateTest {
 
     @Test
     fun `set arms the gate and current returns it`() {
-        CaptchaGate.set("qwant", "https://api.qwant.com/v3/search/web?q=x", "HTTP 403", nowMs = 1000L)
+        CaptchaGate.set("qwant", "https://www.qwant.com/v3/search/web?q=x", "HTTP 403", nowMs = 1000L)
         val p = CaptchaGate.current(nowMs = 2000L)
         assertEquals("qwant", p?.engine)
-        assertEquals("https://api.qwant.com/v3/search/web?q=x", p?.url)
+        assertEquals("https://www.qwant.com/v3/search/web?q=x", p?.url)
         assertEquals("HTTP 403", p?.reason)
         assertEquals(1000L, p?.sinceMs)
     }
@@ -45,8 +45,8 @@ class CaptchaGateTest {
 
     @Test
     fun `set refreshes the same engine in place`() {
-        CaptchaGate.set("qwant", "https://api.qwant.com/v3/search/web?q=a", "HTTP 403", nowMs = 1000L)
-        CaptchaGate.set("qwant", "https://api.qwant.com/v3/search/web?q=b", "HTTP 403", nowMs = 5000L)
+        CaptchaGate.set("qwant", "https://www.qwant.com/v3/search/web?q=a", "HTTP 403", nowMs = 1000L)
+        CaptchaGate.set("qwant", "https://www.qwant.com/v3/search/web?q=b", "HTTP 403", nowMs = 5000L)
         val p = CaptchaGate.current(nowMs = 6000L)
         assertEquals("b", p?.url?.takeLast(1))
         assertEquals(5000L, p?.sinceMs)
@@ -56,7 +56,7 @@ class CaptchaGateTest {
 
     @Test
     fun `clear drops the matching engine`() {
-        CaptchaGate.set("qwant", "https://api.qwant.com", "HTTP 403", nowMs = 1000L)
+        CaptchaGate.set("qwant", "https://www.qwant.com", "HTTP 403", nowMs = 1000L)
         CaptchaGate.clear("qwant")
         assertNull(CaptchaGate.current(nowMs = 2000L))
     }
@@ -73,7 +73,7 @@ class CaptchaGateTest {
     @Test
     fun `a new engine replaces the pending one`() {
         // One check solved at a time; the next blocked search re-arms.
-        CaptchaGate.set("qwant", "https://api.qwant.com", "HTTP 403", nowMs = 1000L)
+        CaptchaGate.set("qwant", "https://www.qwant.com", "HTTP 403", nowMs = 1000L)
         CaptchaGate.set("duckduckgo", "https://html.duckduckgo.com", "HTTP 429", nowMs = 2000L)
         val p = CaptchaGate.current(nowMs = 3000L)
         assertEquals("duckduckgo", p?.engine)
@@ -84,7 +84,7 @@ class CaptchaGateTest {
     @Test
     fun `gate is fresh just under the TTL and stale just past it`() {
         val since = 0L
-        CaptchaGate.set("qwant", "https://api.qwant.com", "HTTP 403", nowMs = since)
+        CaptchaGate.set("qwant", "https://www.qwant.com", "HTTP 403", nowMs = since)
         val ttl = CaptchaGate.STALE_TTL_MS
         assertFalse(CaptchaGate.isStale(CaptchaGate.pending, nowMs = ttl, ttlMs = ttl))
         assertTrue(CaptchaGate.isStale(CaptchaGate.pending, nowMs = ttl + 1, ttlMs = ttl))
@@ -92,7 +92,7 @@ class CaptchaGateTest {
 
     @Test
     fun `current drops a stale gate (self-cleaning, no banner for a dead challenge)`() {
-        CaptchaGate.set("qwant", "https://api.qwant.com", "HTTP 403", nowMs = 0L)
+        CaptchaGate.set("qwant", "https://www.qwant.com", "HTTP 403", nowMs = 0L)
         assertNull(CaptchaGate.current(nowMs = CaptchaGate.STALE_TTL_MS + 1))
         // And the drop is persistent, not per-read.
         assertNull(CaptchaGate.current(nowMs = CaptchaGate.STALE_TTL_MS + 2))
@@ -112,8 +112,8 @@ class CaptchaGateTest {
         // JSON ("some code"). The human-facing origin earns the same
         // domain-scoped clearance cookies.
         assertEquals(
-            "https://api.qwant.com/",
-            solveUrlForHuman("https://api.qwant.com/v3/search/web?q=kenosis&t=web"),
+            "https://www.qwant.com/",
+            solveUrlForHuman("https://www.qwant.com/v3/search/web?q=kenosis&t=web"),
         )
         assertEquals(
             "https://html.duckduckgo.com/",

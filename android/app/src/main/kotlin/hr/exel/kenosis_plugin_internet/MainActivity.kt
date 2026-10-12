@@ -6,6 +6,9 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.CookieManager
+import android.webkit.WebStorage
+import android.webkit.WebView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -14,21 +17,29 @@ import io.flutter.plugin.common.MethodChannel
 import org.json.JSONObject
 
 /**
- * The plugin app's launcher activity. The service (InternetPluginService)
- * runs in the same process, so the UI can read the in-process fetch log
- * (InternetPluginService.snapshotFetchLogJson) directly — no binder round-trip
- * needed, just a MethodChannel hop.
+ * The plugin app's launcher activity + tab UI host.
  *
- * +75 the UI also polls the [CaptchaGate]: when a search engine bot-walls the
- * service, the gate names the engine + the exact blocked URL, and the UI shows
- * a warning banner whose Solve-now action loads that URL in a VISIBLE WebView
- * (the challenge is invisible in the headless fetcher — this is where the user
- * actually solves it). `captchaSolved` clears the gate + cancels the
- * [CaptchaNotifications] ping.
+ * The service (InternetPluginService) runs in the same process, so the UI
+ * can read the in-process fetch log (InternetPluginService.snapshotFetchLogJson)
+ * directly — no binder round-trip needed, just a MethodChannel hop.
+ *
+ * Tabs: [TabManager] holds the visible search/fetch tabs (SERP proof + the
+ * opened page). The Flutter shell wraps chrome (drawer / About / Settings);
+ * the live WebView is the tab. Settings channel methods `getSettings` /
+ * `setSettings` expose [BrowserSettings] (Load images / Enable JavaScript /
+ * Wipe on close).
+ *
+ * Captcha: the UI polls [CaptchaGate] and offers a visible solve surface.
+ * `captchaSolved` is a "user finished" ping — it dismisses the notification;
+ * it must NOT auto-rearm cookies for scraping (the human solved it in a
+ * visible tab; the page just loads).
  */
 class MainActivity : FlutterActivity() {
 
     private val channel = "kenosis_plugin/ui"
+
+    /** Visible tab strip — shared with the service via process-wide holder. */
+    val tabManager = TabHolder.manager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,7 +51,39 @@ class MainActivity : FlutterActivity() {
         // sitting in fetch_log.json (verified on-device 2026-09-28).
         // Idempotent + synchronized — safe alongside the service's own call.
         InternetPluginService.initFetchLogPersistence(this)
+        BrowserSettings.init(this)
         requestNotificationPermissionIfNeeded()
+    }
+
+    override fun onDestroy() {
+        // EXIT privacy only — never an activity-lifecycle tax. presentUi and
+        // config recreates destroy/recreate this activity while the service
+        // still owns the tab WebViews; an unconditional wipe here is what
+        // emptied the strip mid-web_search (2026-10-08 "plugin lost tabs").
+        if (BrowserSettings.shouldWipeOnDestroy(
+                isFinishing = isFinishing,
+                isChangingConfigurations = isChangingConfigurations,
+                invokeInFlight = InternetPluginService.isInvokeInFlight(),
+            )
+        ) {
+            wipeBrowserState()
+        }
+        super.onDestroy()
+    }
+
+    /** Wipe-on-close: tabs + cookies + site storage + cache. Cache is cleared
+     *  on the live tab WebViews before destroy — a throwaway `WebView(this)`
+     *  created inside onDestroy is a leak/crash pattern and never saw the
+     *  tab cookies anyway. */
+    private fun wipeBrowserState() {
+        runCatching {
+            for (tab in tabManager.tabs) {
+                (tab.webView as? WebView)?.clearCache(true)
+            }
+        }
+        runCatching { tabManager.closeAll() }
+        runCatching { CookieManager.getInstance().removeAllCookies(null) }
+        runCatching { WebStorage.getInstance().deleteAllData() }
     }
 
     /** One-time POST_NOTIFICATIONS request (33+): the captcha ping needs it.
@@ -60,9 +103,28 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // Live tab surface: the SAME WebView instances the model extracts
+        // from (TabHolder) — WYSIWYG for the user and the tool.
+        flutterEngine
+            .platformViewsController
+            .registry
+            .registerViewFactory("kenosis_plugin/tab_view", TabViewFactory())
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "getTabs" -> {
+                        result.success(TabHolder.tabsJson())
+                    }
+                    "setActiveTab" -> {
+                        val id = call.argument<Int>("id") ?: -1
+                        result.success(TabHolder.manager.setActive(id) != null)
+                    }
+                    "closeTab" -> {
+                        val id = call.argument<Int>("id") ?: -1
+                        result.success(TabHolder.manager.close(id) != null)
+                    }
+                    // closeAllTabs channel method DELETED (dead code — Flutter
+                    // never calls it). closeAll() stays for wipe-on-close.
                     "getFetchLog" -> {
                         result.success(InternetPluginService.snapshotFetchLogJson())
                     }
@@ -77,15 +139,28 @@ class MainActivity : FlutterActivity() {
                         result.success(captchaJson())
                     }
                     "captchaSolved" -> {
+                        // "User finished" ping only — dismiss the notification.
+                        // NO cookie re-arm for scraping: the human solved it
+                        // in a visible tab; the page just loads and extract
+                        // continues (or the model retries on the coach copy).
                         val engine = call.argument<String>("engine")
                         if (engine != null) {
                             CaptchaGate.clear(engine)
                             CaptchaNotifications.cancel(this, engine)
                         }
-                        // Check resolved — cookies back to denied (see
-                        // CaptchaCookies; the earned jar stays dormant).
-                        CaptchaCookies.setAllowed(false)
                         result.success(null)
+                    }
+                    "getSettings" -> {
+                        result.success(BrowserSettings.toJson())
+                    }
+                    "setSettings" -> {
+                        val loadImages = call.argument<Boolean>("loadImages")
+                        val javaScript = call.argument<Boolean>("javaScript")
+                        val wipeOnClose = call.argument<Boolean>("wipeOnClose")
+                        BrowserSettings.apply(loadImages, javaScript, wipeOnClose)
+                        BrowserSettings.persist(this)
+                        applyBrowserSettingsToTabs()
+                        result.success(BrowserSettings.toJson())
                     }
                     "openExternalUrl" -> {
                         // Play Store hand-off (Get Kenosis AI / About). The
@@ -108,14 +183,24 @@ class MainActivity : FlutterActivity() {
             }
     }
 
+    /** Push Load-images / Enable-JavaScript onto every live tab WebView so a
+     *  settings change takes effect without waiting for the next open. */
+    private fun applyBrowserSettingsToTabs() {
+        runOnUiThread {
+            for (tab in tabManager.tabs) {
+                val webView = tab.webView as? WebView ?: continue
+                webView.settings.javaScriptEnabled = BrowserSettings.javaScript
+                webView.settings.blockNetworkImage = !BrowserSettings.loadImages
+            }
+        }
+    }
+
     /** The pending check as the JSON the Flutter UI polls, or null (none /
      *  stale — a stale gate is dropped here so the UI never shows an
-     *  expired challenge). The 2 s poll is also the cookie policy's
-     *  self-healer: acceptance tracks the gate (CaptchaCookies), covering
-     *  the TTL-staleness drop above, which bypasses clear(). */
+     *  expired challenge). NO cookie re-arm: the human solves the check in
+     *  a visible tab, and `captchaSolved` only dismisses the notification. */
     private fun captchaJson(): String? {
         val p = CaptchaGate.current(System.currentTimeMillis())
-        CaptchaCookies.setAllowed(p != null)
         if (p == null) return null
         return JSONObject()
             .put("engine", p.engine)

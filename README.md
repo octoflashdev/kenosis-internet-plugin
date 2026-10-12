@@ -42,5 +42,5 @@ flutter build apk --debug     # debug build, .debug applicationId suffix
 
 ## License
 
-**Apache License 2.0** — see [LICENSE](LICENSE). Dependencies: OkHttp 4.12.0
-(Apache-2.0), jsoup 1.18.1 (MIT). No copyleft code is linked into the APK.
+**Apache License 2.0** — see [LICENSE](LICENSE). No copyleft code is linked
+into the APK.

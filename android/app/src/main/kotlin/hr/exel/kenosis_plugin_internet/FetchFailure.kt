@@ -12,12 +12,11 @@ import java.util.concurrent.ExecutionException
  * Device evidence (2026-09-26): the assistant model invented plausible URLs
  * for an information need ("current temperature in zagreb" → batacel.com /
  * bbmedia.com / bbcdn.com — none of them weather sites, none mentioned by
- * the user). Each fetch burned 6–25 s across the OkHttp fast path AND the
- * WebView fallback, and the error envelope the model received back was the
- * raw engine string ("Fetch failed: java.lang.IllegalStateException: the
- * page could not be loaded (net::ERR_ADDRESS_UNREACHABLE)") — nothing told
- * the model that the URL itself was dead or that a web search is the right
- * move instead.
+ * the user). Each fetch burned 6–25 s in the tab's WebView, and the error
+ * envelope the model received back was the raw engine string ("Fetch failed:
+ * java.lang.IllegalStateException: the page could not be loaded
+ * (net::ERR_ADDRESS_UNREACHABLE)") — nothing told the model that the URL
+ * itself was dead or that a web search is the right move instead.
  *
  * [describeFetchFailure] keeps the raw reason class in plain language (never
  * hides it) and adds what the model needs: which host failed, in which
@@ -28,10 +27,10 @@ import java.util.concurrent.ExecutionException
 
 /**
  * True when [throwable]'s whole cause chain carries no HTTP response — the
- * host is dead at the DNS/TCP layer, so the hidden-WebView fallback (which
- * beats bot WALLS, not dead hosts) cannot do better and must be skipped.
+ * host is dead at the DNS/TCP layer, so retrying the same URL is pointless
+ * (a human check is a different class: the connection is fine).
  * Never true for bot-wall errors: an HTTP 403/429 means the connection
- * itself is fine and the WebView retry is the recovery path.
+ * itself is fine and a human check is the recovery path.
  */
 fun isTransportDeadError(throwable: Throwable?): Boolean {
     var t: Throwable? = throwable
@@ -56,7 +55,7 @@ fun isTransportDeadError(throwable: Throwable?): Boolean {
 }
 
 /**
- * Translates a raw both-paths-failed message into the error envelope the
+ * Translates a raw failed-fetch message into the error envelope the
  * model reads. Known transport classes get the failing host, a plain-language
  * reason, and the "search instead, don't retry" coach; anything else is
  * returned unchanged.

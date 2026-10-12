@@ -1,5 +1,6 @@
 package hr.exel.kenosis_plugin_internet
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -111,5 +112,76 @@ class RenderRetryPolicyTest {
                 deadlineMs = 2000L,
             )
         )
+    }
+
+    // ---------------- link-walk mode (fast path, plan: verbose-web-search-bubble) ----------------
+
+    @Test
+    fun `link walk first non-empty wins — no stability confirm on the SERP`() {
+        // The fast path's whole point: udm=14 organic anchors are server-
+        // rendered, so the first non-blank link walk is the answer — the
+        // previousText==null retry would only pay a fixed 0.5 s poll.
+        assertFalse(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "https://example.com/a\nhttps://example.com/b",
+                nowMs = 1000L,
+                deadlineMs = 2000L,
+                firstNonEmptyWins = true,
+            )
+        )
+    }
+
+    @Test
+    fun `link walk blank STILL retries — chrome-first SERP re-poll`() {
+        assertTrue(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "",
+                nowMs = 1000L,
+                deadlineMs = 2000L,
+                firstNonEmptyWins = true,
+            )
+        )
+        // And past the deadline it stops exactly like content.
+        assertFalse(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "",
+                nowMs = 2000L,
+                deadlineMs = 2000L,
+                firstNonEmptyWins = true,
+            )
+        )
+    }
+
+    @Test
+    fun `link walk with a previous poll keeps the stability semantics`() {
+        // Once a previousText exists, a link walk behaves like content:
+        // changed text = still hydrating → retry; identical = settled.
+        assertTrue(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "more links",
+                nowMs = 1000L,
+                deadlineMs = 2000L,
+                previousText = "fewer",
+                firstNonEmptyWins = true,
+            )
+        )
+        assertFalse(
+            WebViewPageFetcher.shouldRetryExtraction(
+                "same",
+                nowMs = 1000L,
+                deadlineMs = 2000L,
+                previousText = "same",
+                firstNonEmptyWins = true,
+            )
+        )
+    }
+
+    @Test
+    fun `fast-path SERP constants stay pinned`() {
+        // 600 ms settle + 500 ms re-poll — the link-walk pacing the 7.1 s
+        // fast-path ceiling pin (WebFetchTiersTest) sums from.
+        assertEquals(600L, WebViewPageFetcher.SERP_SETTLE_MS)
+        assertEquals(500L, WebViewPageFetcher.SERP_LINK_POLL_MS)
+        assertEquals(12500L, WebViewPageFetcher.RENDER_CONTENT_DEADLINE_MS)
     }
 }

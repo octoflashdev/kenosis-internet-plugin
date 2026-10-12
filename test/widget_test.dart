@@ -8,6 +8,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:kenosis_plugin_internet/legal/legal_document.dart';
 import 'package:kenosis_plugin_internet/legal/legal_document_repository.dart';
 import 'package:kenosis_plugin_internet/main.dart';
+import 'package:kenosis_plugin_internet/presentation/views/browser_settings_screen.dart';
+import 'package:kenosis_plugin_internet/presentation/widgets/tab_strip.dart';
 import 'package:kenosis_plugin_internet/services/external_links_service.dart';
 import 'package:kenosis_plugin_internet/services/theme_service.dart';
 
@@ -314,14 +316,15 @@ void main() {
       );
     });
 
-    test('bot protection rewrap', () {
-      expect(
-        describeFetchError(
-          'error:the search engine blocked or could not serve its results '
-          '(its bot protection may be blocking this device)',
-        ),
-        contains('blocked this device'),
+    test('bot-wall message passes through — no bypass-era rewrap', () {
+      // The old "blocked this device" coach is gone with the scrape stack.
+      // Honest raw reason, nothing that implies the app can get around it.
+      final gloss = describeFetchError(
+        'error:the search engine blocked or could not serve its results '
+        '(its bot protection may be blocking this device)',
       );
+      expect(gloss, contains('bot protection'));
+      expect(gloss, isNot(contains('blocked this device')));
     });
 
     test('human check envelope maps to the in-app action (+75)', () {
@@ -331,7 +334,15 @@ void main() {
               'Internet Search plugin app, complete the check, then '
               'search again.',
         ),
-        contains('Complete the check'),
+        contains('complete the check'),
+      );
+      expect(
+        describeFetchError(
+          'error:qwant is showing a human check (captcha). Open the '
+              'Internet Search plugin app, complete the check, then '
+              'search again.',
+        ),
+        contains('Open the tab'),
       );
     });
 
@@ -493,7 +504,7 @@ void main() {
 
     String captchaJson() => jsonEncode({
       'engine': 'qwant',
-      'url': 'https://api.qwant.com/v3/search/web?q=test&count=10',
+      'url': 'https://www.qwant.com/?q=test&t=web',
       'reason': 'HTTP 403',
       'sinceMs': 1757941440000,
     });
@@ -674,6 +685,151 @@ void main() {
       // Back on the sheet with both rows still listed (screen header + sheet
       // header again).
       expect(find.text('Requested URLs (2)'), findsNWidgets(2));
+    });
+  });
+
+  group('browser settings — Load images / Enable JavaScript / Wipe on close', () {
+    const channel = MethodChannel('kenosis_plugin/ui');
+
+    /// Defaults per [BrowserSettings]: images ON, JS ON, wipe ON.
+    String defaultsJson() => jsonEncode({
+          'loadImages': true,
+          'javaScript': true,
+          'wipeOnClose': true,
+        });
+
+    Future<void> pumpSettings(
+      WidgetTester tester, {
+      String? settingsJson,
+      bool settingsAvailable = true,
+      void Function(MethodCall)? onSet,
+    }) async {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        (call) async {
+          if (call.method == 'getSettings') {
+            return settingsAvailable ? (settingsJson ?? defaultsJson()) : null;
+          }
+          if (call.method == 'setSettings') {
+            onSet?.call(call);
+            return null;
+          }
+          return null;
+        },
+      );
+      await tester.pumpWidget(const MaterialApp(
+        home: BrowserSettingsScreen(channel: channel),
+      ));
+      await tester.pump();
+      await tester.pump();
+    }
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    testWidgets('defaults render as images ON / JS ON / wipe ON', (tester) async {
+      await pumpSettings(tester);
+
+      expect(find.text('Load images'), findsOneWidget);
+      expect(find.text('Enable JavaScript'), findsOneWidget);
+      expect(find.text('Wipe on close'), findsOneWidget);
+
+      final switches = tester
+          .widgetList<SwitchListTile>(find.byType(SwitchListTile))
+          .toList();
+      expect(switches, hasLength(3));
+      expect(switches[0].value, isTrue, reason: 'Load images default ON');
+      expect(switches[1].value, isTrue, reason: 'Enable JavaScript default ON');
+      expect(switches[2].value, isTrue, reason: 'Wipe on close default ON');
+    });
+
+    testWidgets('toggling a switch sends only that key', (tester) async {
+      final payloads = <Map<Object?, Object?>>[];
+      await pumpSettings(tester, onSet: (call) {
+        payloads.add(Map<Object?, Object?>.from(call.arguments as Map));
+      });
+
+      await tester.tap(find.byType(SwitchListTile).first);
+      await tester.pump();
+      await tester.pump();
+
+      expect(payloads, hasLength(1));
+      expect(payloads.single.keys, ['loadImages']);
+      expect(payloads.single['loadImages'], isFalse);
+    });
+
+    testWidgets('channel down — switches hidden, honest caption', (tester) async {
+      await pumpSettings(tester, settingsAvailable: false);
+
+      expect(find.textContaining('Settings unavailable'), findsOneWidget);
+      expect(find.byType(SwitchListTile), findsNothing);
+    });
+  });
+
+  group('tab strip + URL bar — visible browser chrome', () {
+    testWidgets('TabInfo.fromJson reads id / title / url / focus', (tester) async {
+      final t = TabInfo.fromJson({
+        'id': 7,
+        'title': 'Göbekli Tepe - Wikipedia',
+        'url': 'https://en.wikipedia.org/wiki/G%C3%B6bekli_Tepe',
+        'isForeground': true,
+      });
+      expect(t.id, 7);
+      expect(t.title, 'Göbekli Tepe - Wikipedia');
+      expect(t.url, 'https://en.wikipedia.org/wiki/G%C3%B6bekli_Tepe');
+      expect(t.isForeground, isTrue);
+    });
+
+    testWidgets('strip renders chips and reports activate / close', (tester) async {
+      final activated = <int>[];
+      final closed = <int>[];
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: TabStrip(
+            tabs: const [
+              TabInfo(
+                id: 1,
+                title: 'search: tepe',
+                url: 'https://google.com/search?q=tepe',
+                isForeground: false,
+              ),
+              TabInfo(
+                id: 2,
+                title: 'Wikipedia',
+                url: 'https://en.wikipedia.org/wiki/Gobekli_Tepe',
+                isForeground: true,
+              ),
+            ],
+            onActivate: activated.add,
+            onClose: closed.add,
+          ),
+        ),
+      ));
+
+      expect(find.text('search: tepe'), findsOneWidget);
+      expect(find.text('Wikipedia'), findsOneWidget);
+
+      await tester.tap(find.text('search: tepe'));
+      await tester.pump();
+      expect(activated, [1]);
+
+      await tester.tap(find.byTooltip('Close tab').first);
+      await tester.pump();
+      expect(closed, [1]);
+    });
+
+    testWidgets('URL bar shows the live URL, or the empty state', (tester) async {
+      await tester.pumpWidget(const MaterialApp(
+        home: Scaffold(body: TabUrlBar(url: 'https://example.com/page')),
+      ));
+      expect(find.text('https://example.com/page'), findsOneWidget);
+
+      await tester.pumpWidget(const MaterialApp(
+        home: Scaffold(body: TabUrlBar(url: '')),
+      ));
+      expect(find.text('No page open'), findsOneWidget);
     });
   });
 }

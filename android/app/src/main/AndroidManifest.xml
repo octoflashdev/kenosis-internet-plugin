@@ -3,7 +3,11 @@
          touches the network. The Kenosis host (hr.exel.kenosis_ai) keeps its
          hard no-INTERNET invariant (the architecture decision record, CI-enforced by
          the permission-check CI script); it reaches this app over LOCAL binder
-         only (AIDL IKenosisPlugin). -->
+         only (AIDL IKenosisPlugin).
+
+         Search + page read run through VISIBLE browser tabs (WYSIWYG — the
+         model reads exactly what the tab displays). Captchas are solved by
+         the user in that tab; this app never bypasses a check. -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- +75: the "human check needed" notification (CaptchaNotifications) —
          runtime permission on 33+, requested once by MainActivity on open. -->

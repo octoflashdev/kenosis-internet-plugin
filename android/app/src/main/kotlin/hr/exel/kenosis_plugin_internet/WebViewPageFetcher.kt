@@ -20,48 +20,58 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
 /**
- * Phase-1.5 fallback fetch engine: renders a page in a hidden native
- * [android.webkit.WebView] (the OS WebView IS the JS engine — the Edge
- * Gallery pattern) and extracts its post-JS text. Serves the JS-shell pages
- * (a `<div id="root"></div>` SPA) that the OkHttp+jsoup fast path sees as
- * ~empty text.
+ * Tier 2 of the web-fetch ladder: the VISIBLE-tab extract engine
+ * (plan: anonymous-first-tiered-web-fetch). [WebViewPageFetcher.fetch] renders
+ * a URL into a tab's [WebView] and extracts its post-JS DOM — the escalation
+ * target of Tier 1 ([WebFetchTiers]) and the only route for engine URLs.
+ *
+ * The model reads only what a visible tab displays: this class loads a URL
+ * into a tab's [WebView] (created by [createTabWebView], owned by
+ * [TabManager] / the tab UI) and extracts its post-JS DOM. There is no hidden
+ * renderer, and the tab WebView is NEVER destroyed here — the user can
+ * inspect it at any time.
  *
  * Lifecycle: WebView must be created on the main thread (Android 16 / API 36
- * enforces this strictly — a HandlerThread worked intermittently on older
- * Android but throws `Calling View methods on another thread than the UI
- * thread` on newer releases). So the handler is the main-thread Looper. The
- * WebView is never added to a view hierarchy (headless); `destroy()`s it when
- * the extraction lands (or the watchdog fires, or [close] is called). One fetch
- * at a time; a second concurrent fetch fails fast instead of racing the
- * renderer.
+ * enforces this strictly). The handler is the main-thread Looper; callers on a
+ * binder thread use [createTabWebView] / [onMain] hops. One extraction at a
+ * time; a second concurrent extract fails fast instead of racing the renderer.
  *
- * Budget: the caller (InternetPluginService) enforces the 15 s render cap via
- * `future.get(15 s)`; the internal watchdog below enforces the SAME cap from
- * the inside so a wedged renderer never leaks past `close()`. Fast path (10 s)
- * + WebView (15 s) = 25 s, under the host invoke timeout.
+ * Budget: the caller (InternetPluginService) bounds the wait via
+ * `future.get(...)`; the internal watchdog enforces [RENDER_TIMEOUT_S] from
+ * the inside so a wedged renderer never leaks past [close].
  *
  * Extraction: `document.body.innerText` (after stripping SCRIPT/STYLE/SVG/
  * IFRAME/TEMPLATE). innerText captures all visible text including data values
- * in divs/spans that a selector walk misses — critical for data-heavy SPAs
- * (windfinder, accuweather) that render numbers in non-semantic elements.
+ * in divs/spans that a selector walk misses — critical for data-heavy SPAs.
  *
- * Hygiene: JS on, blockNetworkImage(true) (bandwidth/faster text-ready),
- * LOAD_NO_CACHE, third-party cookies ON (a throwaway headless fetcher with no
- * user identity — SERP bot walls need their challenge cookies; see
- * [createWebView]), first-party cookies left default (logged-out JS pages
- * work). The REAL system-WebView UA with the "; wv)" token stripped
- * ([realWebviewUa]) — sites bot-block the wv token, and a stale hardcoded
- * Chrome version is itself a bot signal.
+ * Hygiene: JS + image load follow [BrowserSettings] (images default ON —
+ * a real browser loads them; JS default ON — SPAs and captcha need it),
+ * domStorage ON, LOAD_NO_CACHE. **Stock UA** — the WebView's own default,
+ * identity marker included. Identity is NOT stripped or spoofed: this client
+ * is a visible browser the user can inspect, and a doctored UA is both a
+ * ToS problem and (a stale hardcoded Chrome) its own bot signal.
  */
 /** WebView render result: the page [title], the post-JS plain [text]
  *  (innerText — RAG/chat grounds on this via the host's .txt), and the
- *  stripped-HTML-precursor [html] (the clone's innerHTML with
- *  SCRIPT/STYLE/SVG/IFRAME/TEMPLATE already removed; Kotlin runs this
- *  through the shared jsoup WEB_SAFELIST so both fetch paths share ONE
- *  allowlist). [html] is the reader sidecar source — display-only. */
+ *  script-stripped [html] (the clone's innerHTML with SCRIPT/STYLE/SVG/
+ *  IFRAME/TEMPLATE removed — display-only sidecar). */
 data class WebViewContent(val title: String, val text: String, val html: String)
 
-class WebViewPageFetcher(context: Context) {
+class WebViewPageFetcher(
+    context: Context,
+    /**
+     * Display-step feed hook (plan: verbose-web-search-bubble) — one call
+     * per render-phase event, `{"code","params"}` shape the service converts
+     * into a progress push. The service wires its `progress()` helper here at
+     * the lazy init; tests pass the inert default. Display-only facts (see
+     * the payload contract on InternetPluginService.progress): counts /
+     * statuses / the failure-reason CLASSES — never page text, a URL with
+     * embedded query content, or a raw redirect target. Fires on the MAIN
+     * thread (all pipeline seams run there) and is fire-and-forget — a hook
+     * failure must never break a render (each emission is best-effort).
+     */
+    private val onProgress: (code: String, params: JSONObject) -> Unit = { _, _ -> },
+) {
 
     companion object {
         private const val TAG = "InternetPlugin"
@@ -76,43 +86,43 @@ class WebViewPageFetcher(context: Context) {
          * the DOM. Capped by the 15 s watchdog.
          */
         private const val AJAX_SETTLE_DELAY_MS = 5000L
+        /** Interval between empty-render extraction retries. */
+        private const val EMPTY_RENDER_POLL_MS = 2000L
+
+        /**
+         * SERP LINK-WALK settle (fast path, plan: verbose-web-search-bubble):
+         * the anchor walk only collects RESULT hrefs — udm=14 organic anchors
+         * are SERVER-RENDERED, in the initial HTML the way the text walk's
+         * data tables are not, so the 5 s AJAX wait buys nothing for them.
+         * The blank-guard poll (see [shouldRetryExtraction] in link mode)
+         * still covers a slow/challenged SERP. Content walks keep the full
+         * 5 s. Part of the controllable fast-path ceiling pinned in
+         * WebFetchTiersTest: SERP_SETTLE_MS + SERP_LINK_POLL_MS +
+         * WebFetchTiers.T1_TIMEOUT_MS + T1_FANOUT_WAIT_MARGIN_MS ≤ 7100.
+         */
+        const val SERP_SETTLE_MS = 600L
+
+        /** SERP link-walk BLANK re-poll cadence — faster than the content
+         *  walk's 2 s text poll because a blank SERP is (a) chrome-hydration
+         *  (organic anchors land seconds later) or (b) a challenge shell, and
+         *  0.5 s detects either without stretching the 12.5 s deadline. */
+        const val SERP_LINK_POLL_MS = 500L
+
         /**
          * Hard deadline (from load start) for the extracted text to become
          * non-blank; the empty-render poll loop stops here, before the 15 s
          * watchdog, so the fetch fails with the specific "no readable
-         * content" reason instead of a generic render timeout.
+         * content" reason instead of a generic render timeout. UNCHANGED for
+         * BOTH walk modes (the link walk re-polls into the same deadline).
          */
         const val RENDER_CONTENT_DEADLINE_MS = 12500L
-        /** Interval between empty-render extraction retries. */
-        private const val EMPTY_RENDER_POLL_MS = 2000L
-        /** Fallback UA when the system WebView's own is unavailable (see
-         *  [realWebviewUa]). Chrome-mobile, no "; wv)" token. */
-        private const val WEBVIEW_UA =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/120.0 Mobile Safari/537.36"
 
-        /**
-         * Pure, unit-testable: the REAL system-WebView user agent with the
-         * "; wv)" token stripped (that token is how sites detect and bot-block
-         * WebViews). Using the real UA matters beyond honesty: the previously
-         * hardcoded Chrome/120 was two years stale by 2026-09 — an outdated
-         * browser version is ITSELF a bot-protection signal, and Qwant's
-         * DataDome hung its challenge on the stale UA in the +73 live test
-         * (shell rendered script-only and never self-healed). The real UA
-         * carries the device's actual Chrome version + Android version.
-         * Null/blank input → [WEBVIEW_UA] fallback; so does a pathological
-         * input whose stripped form lost its UA identity (no "Mozilla").
-         */
-        fun realWebviewUa(defaultUa: String?): String {
-            val ua = defaultUa?.trim().orEmpty()
-            if (ua.isEmpty()) return WEBVIEW_UA
-            val stripped = ua.replace("; wv)", ")")
-            return if (stripped.isBlank() || !stripped.contains("Mozilla")) {
-                WEBVIEW_UA
-            } else {
-                stripped
-            }
-        }
+        /** The exact failure text for a render that never produced readable
+         *  content — thrown AND matched on by the tier router ([WebFetchTiers]
+         *  routes it to Tier 3 for browser_fetch; the web_search walk keeps
+         *  its own try-next-candidate semantics). Public so the string match
+         *  in InternetPluginService is exact, never a copy. */
+        const val TAB_EMPTY_MSG = "the page rendered no readable content"
 
         /**
          * Pure, unit-testable: should the extraction be retried?
@@ -131,15 +141,30 @@ class WebViewPageFetcher(context: Context) {
          * consecutive identical extracts = settled = no retry. A passed
          * deadline never retries: blank fails honestly; non-blank-unstable
          * completes with the latest text at the caller.
+         *
+         * LINK WALKS ([firstNonEmptyWins] — fast path, the SERP only): the
+         * first NON-BLANK walk WINS outright — anchors don't hydrate like
+         * data tables (the udm=14 anchors are server-rendered), so the
+         * stability confirm would just pay a fixed 0.5 s poll for nothing.
+         * A BLANK link walk still re-polls (chrome-first SERPs, challenge
+         * shells) to the unchanged deadline, same as content.
          */
         fun shouldRetryExtraction(
             text: String,
             nowMs: Long,
             deadlineMs: Long,
             previousText: String? = null,
+            firstNonEmptyWins: Boolean = false,
         ): Boolean {
             if (nowMs >= deadlineMs) return false
             if (text.isBlank()) return true
+            if (firstNonEmptyWins && previousText == null) {
+                // First non-empty link walk — the SERP's results are readable
+                // as-is; skipping the stability confirm is the fast path's
+                // win, and hydration re-polling of CONTENT (link walk never
+                // has a previousText confirmed table) does not apply.
+                return false
+            }
             if (previousText == null) return true
             return text != previousText
         }
@@ -153,13 +178,13 @@ class WebViewPageFetcher(context: Context) {
          * page is content.
          *
          * Why this exists — the WebView fires onPageFinished for its own ERROR
-         * page too. +73 on-device regression: Google IFL picked a Facebook
-         * post as the top result; Facebook redirected the render to a
-         * `fb://native_post/…` deep link, the WebView showed "Web page not
-         * available … net::ERR_UNKNOWN_URL_SCHEME", and the extractor served
-         * that 212-char error text to the model as the search observation.
-         * A redirect to a non-web scheme (fb://, intent://, twitter://…) or
-         * any main-frame load error must FAIL the fetch, never extract.
+         * page too. +73 on-device regression: a top result was a Facebook
+         * post; Facebook redirected the render to a `fb://native_post/…` deep
+         * link, the WebView showed "Web page not available …
+         * net::ERR_UNKNOWN_URL_SCHEME", and the extractor served that 212-char
+         * error text to the model as the search observation. A redirect to a
+         * non-web scheme (fb://, intent://, twitter://…) or any main-frame
+         * load error must FAIL the fetch, never extract.
          */
         fun loadFailureReason(pageUrl: String?, mainFrameError: String?): String? {
             if (mainFrameError != null) {
@@ -220,12 +245,9 @@ class WebViewPageFetcher(context: Context) {
          * data. innerText is the same thing Readability.js / reader-mode uses.
          *
          * Also returns `html`: the clone's `innerHTML` (SCRIPT/STYLE/SVG/IFRAME/
-         * TEMPLATE already removed by the clone strip) — the precursor to the
-         * reader sidecar. Kotlin runs it through the jsoup WEB_SAFELIST so only
-         * `<b>/<br>/<p>/headings/lists` survive (no `<img>/<a>/<script>`/attrs).
-         * Capped at 500k here (MAX_TEXT_CHARS) to bound the evaluateJavascript
-         * return; the reader caps it again as defense-in-depth. The JS does the
-         * COARSE script/style strip; jsoup does the FINE tag allowlist.
+         * TEMPLATE already removed by the clone strip) — the display-only
+         * sidecar. Capped at 500k here (MAX_TEXT_CHARS) to bound the
+         * evaluateJavascript return.
          *
          * Returns the OBJECT (not a JSON string) so evaluateJavascript delivers
          * it as a plain `{"title":..,"text":..,"html":..}` document to Kotlin.
@@ -258,13 +280,38 @@ class WebViewPageFetcher(context: Context) {
 })()"""
 
         /**
-         * SERP anchor walk (+73): collect ABSOLUTE http(s) anchor hrefs in
-         * document order, deduped, capped — joined with newlines in the SAME
-         * {title, text} envelope the text walk uses, so the whole
-         * render/poll/complete pipeline is shared verbatim: an empty link
-         * list is blank text and is polled/retried until the content
-         * deadline exactly like a blank article render. Used by
-         * [fetchLinks] (web_search's google SERP fallback).
+         * SERP anchor walk: collect ABSOLUTE http(s) anchor hrefs, deduped,
+         * RESULT-LIKE FIRST — joined with newlines in the SAME {title, text}
+         * envelope the text walk uses, so the whole render/poll/complete
+         * pipeline is shared verbatim: an empty link list is blank text and is
+         * polled/retried until the content deadline exactly like a blank
+         * article render. Used by [fetchLinks] (web_search's SERP walk on the
+         * visible SERP tab).
+         *
+         * ORDERING (2026-10-07 on-device, twice: `40/45 links → 0 usable`):
+         * mobile Google leads with ~40 engine-family chrome hrefs (accounts,
+         * support, policies, www.google nav) BEFORE the organic results. A
+         * naive "off-site" test treats `accounts.google.com` as a result
+         * (different hostname from `www.google.com`) and the results bucket
+         * fills with chrome — real links never get collected. Result-shaped
+         * here means: an engine redirector (`/url?`, `/goto?`, `/l/?`,
+         * `/redirect?`) or an off-site host that is NOT in the engine family
+         * (google.*, doubleclick, duckduckgo, qwant, gstatic,
+         * googleusercontent, googleapis, ggpht). Engine-family leftovers ride
+         * in `other`.
+         *
+         * GOTO TOKENS (2026-10-07 CDP probe of the live SERP): Google now
+         * serves organic results as `a.UBFage[href="/goto?url=CAES-…"]` —
+         * the target is an ENCRYPTED blob (not a plaintext URL in `href`,
+         * `ping`, `data-*` or `jsdata`; `data-href` count was 0). It cannot
+         * be unwrapped client-side; the Lucky tab NAVIGATES the goto URL and
+         * Google 302s to the real page. The camera/Lens button also rides
+         * `/goto?url=CAES-…` (`a.v9gBvd`) with an EMPTY text label — so a
+         * redirector href is result-shaped ONLY when the anchor has non-empty
+         * visible text (the result card: title + cite + snippet). Empty-text
+         * redirector anchors are chrome and are skipped entirely (not even
+         * `other` — Kotlin's [InternetPluginService.isEngineRedirector]
+         * exemption would otherwise let them through as candidates).
          *
          * ESCAPING: this is a Kotlin RAW string — backslashes pass through
          * VERBATIM, so JS escapes need a SINGLE backslash (`\/`, `'\n'`), not
@@ -279,54 +326,119 @@ class WebViewPageFetcher(context: Context) {
          */
         private const val LINK_WALK_JS = """(function () {
   var seen = {};
-  var links = [];
+  var results = [];
+  var other = [];
+  function isEngineFamily(host) {
+    return /(^|\.)(google\.[a-z.]+|doubleclick\.net|duckduckgo\.com|qwant\.com|gstatic\.com|googleusercontent\.com|googleapis\.com|ggpht\.com)$/.test(host);
+  }
   var anchors = document.querySelectorAll('a[href]');
   for (var i = 0; i < anchors.length; i++) {
     var href = anchors[i].href;
     if (!/^https?:\/\//i.test(href)) continue;
     if (seen[href]) continue;
     seen[href] = 1;
-    links.push(href);
-    if (links.length >= 40) break;
+    // Engine redirectors carry the real target (plaintext) or an encrypted
+    // goto token. Result-shaped ONLY with visible card text — empty-text
+    // redirector anchors are chrome (the camera/Lens `/goto?url=CAES-…`).
+    if (/\/url\?|\/goto\?|\/l\/\?|\/redirect\?/.test(href)) {
+      var label = (anchors[i].innerText || '').trim();
+      if (label && results.length < 40) results.push(href);
+      continue;
+    }
+    var organic = false;
+    try {
+      var host = new URL(href).hostname;
+      organic = !isEngineFamily(host);
+    } catch (e) {
+      organic = false;
+    }
+    if (organic) {
+      if (results.length < 40) results.push(href);
+    } else if (other.length < 40) {
+      other.push(href);
+    }
   }
+  var links = results.concat(other);
   return {title: (document.title || '').trim(), text: links.join('\n')};
 })()"""
 
         /**
-         * Raw-HTML walk (+75): return the page's full `outerHTML` (capped) in
-         * the SAME {title, text} envelope — `text` CARRIES the HTML. Used by
-         * [fetchHtml] for the duckduckgo SERP retry, where the resolver needs
-         * the anchor markup, not text or hrefs alone. A challenge/bot-wall
-         * page's outerHTML is never blank (head + script tags count), so the
-         * blank-render retry loop completes on the first extraction — right
-         * for this walk: challenge HTML goes back to the caller, whose
-         * resolver + captcha detection take over; a real SERP HTML parses
-         * into results directly.
-         *
-         * ESCAPING: Kotlin RAW string — single backslashes for JS escapes
-         * (see [LINK_WALK_JS] for the +73 doubled-backslash regression).
+         * Raw-HTML walk: DELETED (dead code — no production caller). The
+         * captcha probe uses [extractLoaded] / [DOM_WALK_JS] text+html, and
+         * the SERP walk uses [LINK_WALK_JS].
          */
-        private const val HTML_WALK_JS = """(function () {
-  var html = document.documentElement ? document.documentElement.outerHTML : '';
-  if (html.length > 500000) { html = html.substring(0, 500000); }
-  return {title: (document.title || '').trim(), text: html};
-})()"""
-
     }
 
     private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private val busy = AtomicBoolean(false)
-    private var currentWebView: WebView? = null
+    private val pending = java.util.Collections.synchronizedList(
+        mutableListOf<CompletableFuture<*>>(),
+    )
 
     /**
-     * Fetch `url` in a hidden WebView and extract its post-JS text + the
-     * stripped-HTML precursor ([WebViewContent]). Returns a Future the caller
-     * bounds with [RENDER_TIMEOUT_S] (the internal watchdog enforces the same
-     * cap and destroys the renderer either way).
+     * Create a VISIBLE tab WebView (stock UA + [BrowserSettings]). MUST run on
+     * the main thread — binder callers hop via [onMain].
      */
-    fun fetch(url: String): Future<WebViewContent> =
-        startFetch(url, DOM_WALK_JS) { json ->
+    @SuppressLint("SetJavaScriptEnabled")
+    fun createTabWebView(): WebView {
+        val webView = WebView(appContext)
+        webView.settings.apply {
+            javaScriptEnabled = BrowserSettings.javaScript
+            blockNetworkImage = !BrowserSettings.loadImages
+            domStorageEnabled = true
+            cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
+            // STOCK UA — do not touch userAgentString. The WebView default
+            // is the honest identity of a WebView-based browser; stripping
+            // or spoofing it misrepresents the client.
+        }
+        // A real tab needs cookies (login walls, captcha clearance, site
+        // continuity). Wipe-on-close ([BrowserSettings.wipeOnClose]) owns
+        // the other end — this is a browser, not a fetch-and-forget client.
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        // Title reporting for the tab strip (URL rides the extract path's
+        // WebViewClient — the tab surface must never replace that one).
+        webView.webChromeClient = object : android.webkit.WebChromeClient() {
+            override fun onReceivedTitle(view: WebView, title: String?) {
+                TabHolder.updateChromeFor(view, title, view.url)
+            }
+        }
+        return webView
+    }
+
+    /**
+     * Run [block] on the main thread and return its result (bounded).
+     *
+     * Every WebView call must land here when the caller is a binder thread —
+     * `WebView.getUrl()` is NOT safe off-main and throws after a successful
+     * extract (2026-10-07: AccuWeather returned 4890 chars / 19°C and the
+     * result was discarded by a binder-thread `url` read). Catch is
+     * [Throwable] on purpose: WebView's thread check historically throws a
+     * bare `java.lang.Throwable`, and an `Exception`-only catch would leave
+     * this future incomplete until the 5 s timeout.
+     */
+    fun <T> onMain(block: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        val future = CompletableFuture<T>()
+        handler.post {
+            try {
+                future.complete(block())
+            } catch (e: Throwable) {
+                future.completeExceptionally(e)
+            }
+        }
+        return future.get(5, TimeUnit.SECONDS)
+    }
+
+    /**
+     * Load `url` in the TAB's WebView and extract its post-JS text + the
+     * script-stripped HTML ([WebViewContent]). The tab WebView stays alive —
+     * the user can inspect it. Returns a Future the caller bounds with
+     * [RENDER_TIMEOUT_S].
+     */
+    fun fetch(webView: WebView, url: String): Future<WebViewContent> =
+        startFetch(webView, url, DOM_WALK_JS, CONTENT_WALK) { json ->
             WebViewContent(
                 title = json.optString("title", ""),
                 text = json.optString("text", ""),
@@ -335,37 +447,89 @@ class WebViewPageFetcher(context: Context) {
         }
 
     /**
-     * Fetch `url` in a hidden WebView and collect its ANCHOR hrefs (the SERP
+     * Load `url` in the TAB's WebView and collect its ANCHOR hrefs (the SERP
      * anchor walk — see [LINK_WALK_JS]): the future resolves to
      * (title, newline-joined links); the caller splits and filters. Same
-     * pipeline, caps, and failure semantics as [fetch].
+     * pipeline, caps, and failure semantics as [fetch], on the SERP WALK
+     * mode (fast path: 0.6 s settle, first non-empty walk wins, 0.5 s blank
+     * re-poll — see [SERP_LINK_WALK]).
      */
-    fun fetchLinks(url: String): Future<Pair<String, String>> =
-        startFetch(url, LINK_WALK_JS) { json ->
+    fun fetchLinks(webView: WebView, url: String): Future<Pair<String, String>> =
+        startFetch(webView, url, LINK_WALK_JS, SERP_LINK_WALK) { json ->
             json.optString("title", "") to json.optString("text", "")
         }
 
     /**
-     * Fetch `url` in a hidden WebView and return its RAW HTML
-     * ([HTML_WALK_JS] — `documentElement.outerHTML`, capped). The SERP retry
-     * for HTML engines (duckduckgo): the DOM/text walks destroy the anchor
-     * MARKUP the resolvers parse ([InternetPluginService.resolveDdgResultUrls]
-     * needs `a.result__a` elements, innerText is plain text), so the retry
-     * hands the post-JS DOM back verbatim. A challenge shell returns its
-     * challenge HTML — the caller's resolver then yields nothing and the
-     * captcha path takes over; a SOLVED challenge (clearance cookie from the
-     * visible solve-it WebView, shared process-wide via CookieManager)
-     * returns the real SERP and the resolver reads it. Same pipeline, caps,
-     * and failure semantics as [fetch].
+     * Extract from the tab's ALREADY-LOADED DOM (no navigation) — e.g. a
+     * captcha probe of the SERP tab after [fetchLinks] already settled it.
      */
-    fun fetchHtml(url: String): Future<String> =
-        startFetch(url, HTML_WALK_JS) { json ->
-            json.optString("text", "")
+    fun extractLoaded(webView: WebView): Future<WebViewContent> =
+        startExtract(webView, contentDeadlineMs(), DOM_WALK_JS, CONTENT_WALK, { json ->
+            WebViewContent(
+                title = json.optString("title", ""),
+                text = json.optString("text", ""),
+                html = json.optString("html", ""),
+            )
+        }, finished = AtomicBoolean(false))
+
+    /**
+     * Re-walk the ALREADY-LOADED DOM's anchors (no navigation). The first
+     * [fetchLinks] can settle on chrome-only hrefs while the organic results
+     * are still hydrating; this picks them up from the live page — on the
+     * SERP WALK mode (first non-empty wins here too: the re-walk only happens
+     * after a candidate-less first walk, so a page that now HAS anchors must
+     * not wait for a second confirm).
+     */
+    fun extractLinksLoaded(webView: WebView): Future<Pair<String, String>> =
+        startExtract(webView, contentDeadlineMs(), LINK_WALK_JS, SERP_LINK_WALK, { json ->
+            json.optString("title", "") to json.optString("text", "")
+        }, finished = AtomicBoolean(false))
+
+    /** Tear down pending extractions (service onDestroy). Tab WebViews are
+     *  owned by [TabManager] and are NOT destroyed here. Idempotent. */
+    fun close() {
+        handler.post {
+            val doomed = synchronized(pending) { pending.toList() }
+            pending.clear()
+            for (f in doomed) {
+                f.completeExceptionally(
+                    IllegalStateException("WebViewPageFetcher closed"),
+                )
+            }
+            busy.set(false)
         }
+    }
+
+    // ------------------------------------------------------------------ //
+    // Pipeline — everything below runs on the main thread                 //
+    // ------------------------------------------------------------------ //
+
+    /**
+     * One EXTRACTION WALK's pacing (fast path, plan: verbose-web-search-
+     * bubble). The whole pipeline shares one shape — load → settle →
+     * extract → poll — so a walk mode is the three knobs that differ:
+     *  - CONTENT: the 5 s AJAX settle + 2 s stability/blank poll ([fetch],
+     *    the Lucky tab, the captcha probe) — untouched.
+     *  - SERP_LINK: 0.6 s settle + 0.5 s blank poll + first-non-empty-wins
+     *    ([fetchLinks], [extractLinksLoaded] — anchor hrefs, fast path).
+     */
+    private data class WalkMode(
+        val settleMs: Long,
+        val pollMs: Long,
+        val firstNonEmptyWins: Boolean,
+    )
+
+    private val CONTENT_WALK = WalkMode(AJAX_SETTLE_DELAY_MS, EMPTY_RENDER_POLL_MS, false)
+    private val SERP_LINK_WALK = WalkMode(SERP_SETTLE_MS, SERP_LINK_POLL_MS, true)
+
+    private fun contentDeadlineMs(): Long =
+        System.currentTimeMillis() + RENDER_CONTENT_DEADLINE_MS
 
     private fun <R> startFetch(
+        webView: WebView,
         url: String,
         js: String,
+        mode: WalkMode,
         parser: (JSONObject) -> R,
     ): Future<R> {
         val future = CompletableFuture<R>()
@@ -373,65 +537,65 @@ class WebViewPageFetcher(context: Context) {
             future.completeExceptionally(IllegalStateException("WebView fetcher busy"))
             return future
         }
+        synchronized(pending) { pending.add(future) }
         val finished = AtomicBoolean(false)
-        handler.post { startLoad(url, future, finished, js, parser) }
+        handler.post { startLoad(webView, url, future, finished, js, parser, mode) }
         return future
     }
 
-    /** Tear down everything (called from Service.onDestroy). Idempotent. */
-    fun close() {
-        handler.post {
-            currentWebView?.let {
-                Log.d(TAG, "WebViewPageFetcher: destroying pending renderer (close)")
-                destroyWebView(it)
-            }
-            currentWebView = null
+    private fun <R> startExtract(
+        webView: WebView,
+        contentDeadline: Long,
+        js: String,
+        mode: WalkMode,
+        parser: (JSONObject) -> R,
+        finished: AtomicBoolean,
+    ): Future<R> {
+        val future = CompletableFuture<R>()
+        if (!busy.compareAndSet(false, true)) {
+            future.completeExceptionally(IllegalStateException("WebView fetcher busy"))
+            return future
         }
+        synchronized(pending) { pending.add(future) }
+        handler.post {
+            extractWithRetry(webView, contentDeadline, future, finished, js, parser, mode)
+        }
+        return future
     }
 
-    // ------------------------------------------------------------------ //
-    // Pipeline — everything below runs on the HandlerThread               //
-    // ------------------------------------------------------------------ //
-
-    @SuppressLint("SetJavaScriptEnabled")
     private fun <R> startLoad(
+        webView: WebView,
         url: String,
         future: CompletableFuture<R>,
         finished: AtomicBoolean,
         js: String,
         parser: (JSONObject) -> R,
+        mode: WalkMode,
     ) {
         // Deadline for the extracted text to become non-blank (see
         // [shouldRetryExtraction]) — measured from load start, before the
         // 15 s watchdog, so a blank render fails with the specific reason.
-        val contentDeadline = System.currentTimeMillis() + RENDER_CONTENT_DEADLINE_MS
+        val contentDeadline = contentDeadlineMs()
         // Internal watchdog: same 15 s cap the caller enforces via future.get —
-        // this side guarantees the renderer is destroyed even if the caller
-        // already gave up and walked away from the future.
+        // this side guarantees the future settles even if the caller already
+        // gave up. The TAB WebView is left alone (still visible).
         handler.postDelayed({
-            if (finished.compareAndSet(false, true)) {
-                busy.set(false)
-                future.completeExceptionally(
-                    TimeoutException("WebView render exceeded ${RENDER_TIMEOUT_S}s")
+            Log.w(TAG, "FC: [InternetPlugin] webview render timeout (${RENDER_TIMEOUT_S}s): $url")
+            onProgress("render_timeout", JSONObject())
+            completeFetch(finished, future) {
+                it.completeExceptionally(
+                    TimeoutException("WebView render exceeded ${RENDER_TIMEOUT_S}s"),
                 )
-                Log.w(TAG, "FC: [InternetPlugin] webview render timeout (${RENDER_TIMEOUT_S}s): $url")
-                currentWebView?.let { destroyWebView(it) }
-                currentWebView = null
             }
         }, TimeUnit.SECONDS.toMillis(RENDER_TIMEOUT_S))
 
-        val webView = try {
-            createWebView()
-        } catch (e: Exception) {
-            Log.w(TAG, "FC: [InternetPlugin] webview create failed: $e")
-            if (finished.compareAndSet(false, true)) {
-                busy.set(false)
-                future.completeExceptionally(e)
-            }
-            return
-        }
-        currentWebView = webView
-
+        // THE WebViewClient for this tab — the tab surface must NOT replace it
+        // (2026-10-08: TabPlatformView's chrome client stole it mid-fetch after
+        // presentUi launched the UI; onPageFinished then never reached the
+        // extract pipeline → 15 s render timeout on a SERP the user could already
+        // see, and the Lucky tab never got a URL). Chrome reporting for every
+        // later navigation (user clicks) lives HERE too, so the client stays
+        // installed after the fetch completes.
         webView.webViewClient = object : WebViewClient() {
             private var pageFinished = false
             /** First main-frame error of the CURRENT navigation; reset per
@@ -442,6 +606,16 @@ class WebViewPageFetcher(context: Context) {
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 mainFrameError = null
+                TabHolder.updateChromeFor(view, view.title, url)
+            }
+
+            override fun doUpdateVisitedHistory(
+                view: WebView,
+                url: String?,
+                isReload: Boolean,
+            ) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                TabHolder.updateChromeFor(view, view.title, url ?: view.url)
             }
 
             override fun onReceivedError(
@@ -471,6 +645,9 @@ class WebViewPageFetcher(context: Context) {
             }
 
             override fun onPageFinished(view: WebView, pageUrl: String?) {
+                // Chrome first — user clicks after this fetch still need live
+                // title/URL, and the first-finish gate below must not skip them.
+                TabHolder.updateChromeFor(view, view.title, pageUrl ?: view.url)
                 // onPageFinished can fire more than once (history/redirects);
                 // start the AJAX-settle wait only for the first main-frame finish.
                 if (pageFinished || finished.get()) return
@@ -483,51 +660,31 @@ class WebViewPageFetcher(context: Context) {
                 val failure = loadFailureReason(pageUrl, mainFrameError)
                 if (failure != null) {
                     Log.w(TAG, "FC: [InternetPlugin] webview load failed: $failure")
-                    completeFetch(view, future, finished) {
+                    // Progress feed (display-only): the failure-REASON CLASS —
+                    // loadFailureReason carries error descriptions / deep-link
+                    // shapes, never query params. Truncate defensively.
+                    onProgress(
+                        "load_failed",
+                        JSONObject().put("reason", failure.take(120)),
+                    )
+                    completeFetch(finished, future) {
                         it.completeExceptionally(IllegalStateException(failure))
                     }
                     return
                 }
-                waitReadyThenExtract(view, contentDeadline, future, finished, js, parser)
+                // Progress feed: the first main-frame finish of THIS load.
+                onProgress("page_loaded", JSONObject())
+                waitReadyThenExtract(view, contentDeadline, future, finished, js, parser, mode)
             }
         }
         webView.loadUrl(url)
     }
 
-    private fun createWebView(): WebView {
-        val webView = WebView(appContext)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            blockNetworkImage = true
-            cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
-            // The REAL system-WebView UA with the "; wv)" detection token
-            // stripped — see [realWebviewUa] for why the real version
-            // matters (the stale hardcoded Chrome/120 was itself a bot
-            // signal).
-            userAgentString = realWebviewUa(
-                android.webkit.WebSettings.getDefaultUserAgent(appContext),
-            )
-            // First-party acceptance is the process-wide CookieManager flag
-            // (CaptchaCookies): DENIED except while a human check is pending.
-            // Third-party follows the gate below. No DOM storage changes —
-            // leave platform defaults.
-        }
-        // Third-party cookies only while a human check is pending: the SERP
-        // bot walls (Qwant's DataDome, +73 live test) only complete their
-        // challenge flow when the challenge domains (e.g.
-        // *.captcha-delivery.com) can set their cookies. Outside that flow
-        // this is a throwaway headless fetcher with no user identity or
-        // session — fetch-and-forget (user directive, +75): no cookies at
-        // all, first- or third-party.
-        CookieManager.getInstance()
-            .setAcceptThirdPartyCookies(webView, CaptchaGate.pending != null)
-        return webView
-    }
-
-    /** Wait [AJAX_SETTLE_DELAY_MS] after onPageFinished for AJAX/XHR data to
+    /** Wait [WalkMode.settleMs] after onPageFinished for AJAX/XHR data to
      *  populate the DOM, then extract. readyState is already "complete" by the
      *  time onPageFinished fires, so polling it is useless — the data we need
-     *  arrives via post-load XHR, not initial resource loading. */
+     *  arrives via post-load XHR, not initial resource loading. (SERP link
+     *  walks settle a shorter 600 ms — see [WalkMode].) */
     private fun <R> waitReadyThenExtract(
         webView: WebView,
         contentDeadline: Long,
@@ -535,14 +692,17 @@ class WebViewPageFetcher(context: Context) {
         finished: AtomicBoolean,
         js: String,
         parser: (JSONObject) -> R,
+        mode: WalkMode,
     ) {
         if (finished.get()) return
-        Log.d(TAG, "FC: [InternetPlugin] webview waiting ${AJAX_SETTLE_DELAY_MS}ms for AJAX settle")
+        Log.d(TAG, "FC: [InternetPlugin] webview waiting ${mode.settleMs}ms for AJAX settle")
+        onProgress("settle_wait", JSONObject().put("ms", mode.settleMs))
         handler.postDelayed({
             if (finished.get()) return@postDelayed
             Log.d(TAG, "FC: [InternetPlugin] webview AJAX settle elapsed — extracting")
-            extractWithRetry(webView, contentDeadline, future, finished, js, parser)
-        }, AJAX_SETTLE_DELAY_MS)
+            onProgress("settle_done", JSONObject())
+            extractWithRetry(webView, contentDeadline, future, finished, js, parser, mode)
+        }, mode.settleMs)
     }
 
     /**
@@ -550,12 +710,11 @@ class WebViewPageFetcher(context: Context) {
      * STILL HYDRATING.
      *
      * A blank render before the deadline is usually a bot-wall challenge
-     * shell — DataDome's first paint (Qwant SERP, +73 live test) is
-     * script-only with zero visible text; its challenge JS then runs, sets
-     * the clearance cookie and RELOADS the page with the real payload, all
-     * after our first onPageFinished — or a very slow SPA still hydrating.
-     * Every attempt reads the LIVE DOM, so a reload that lands between
-     * attempts is captured by the next one.
+     * shell — DataDome's first paint is script-only with zero visible text;
+     * its challenge JS then runs, sets the clearance cookie and RELOADS the
+     * page with the real payload, all after our first onPageFinished — or a
+     * very slow SPA still hydrating. Every attempt reads the LIVE DOM, so a
+     * reload that lands between attempts is captured by the next one.
      *
      * Progressive hydration (2026-10-03 on-device, yr.no daily-table): the
      * chrome + current-conditions render first, the data table arrives via a
@@ -575,6 +734,7 @@ class WebViewPageFetcher(context: Context) {
         finished: AtomicBoolean,
         js: String,
         parser: (JSONObject) -> R,
+        mode: WalkMode,
         previousText: String? = null,
     ) {
         if (finished.get()) return
@@ -595,7 +755,7 @@ class WebViewPageFetcher(context: Context) {
                 text = json.optString("text", "")
             } catch (e: Exception) {
                 Log.w(TAG, "FC: [InternetPlugin] webview extraction failed: $e")
-                completeFetch(webView, future, finished) { it.completeExceptionally(e) }
+                completeFetch(finished, future) { it.completeExceptionally(e) }
                 return@evaluateJavascript
             }
             if (shouldRetryExtraction(
@@ -603,13 +763,22 @@ class WebViewPageFetcher(context: Context) {
                     System.currentTimeMillis(),
                     contentDeadline,
                     previousText,
+                    firstNonEmptyWins = mode.firstNonEmptyWins,
                 )
             ) {
                 val why =
                     if (text.isBlank()) "render blank" else "text still changing (hydration)"
                 Log.d(
                     TAG,
-                    "FC: [InternetPlugin] webview $why — retrying in ${EMPTY_RENDER_POLL_MS}ms",
+                    "FC: [InternetPlugin] webview $why — retrying in ${mode.pollMs}ms",
+                )
+                // Progress feed: the poll/retry event, with the reason class
+                // ("blank" | "hydration") and the NEXT poll's interval.
+                onProgress(
+                    "render_retry",
+                    JSONObject()
+                        .put("why", if (text.isBlank()) "blank" else "hydration")
+                        .put("pollMs", mode.pollMs),
                 )
                 handler.postDelayed({
                     extractWithRetry(
@@ -619,17 +788,21 @@ class WebViewPageFetcher(context: Context) {
                         finished,
                         js,
                         parser,
+                        mode,
                         previousText = text,
                     )
-                }, EMPTY_RENDER_POLL_MS)
+                }, mode.pollMs)
                 return@evaluateJavascript
             }
             if (text.isBlank()) {
                 val title = json.optString("title", "")
                 Log.w(TAG, "FC: [InternetPlugin] webview rendered no readable content (title=${title.take(60)})")
-                completeFetch(webView, future, finished) {
+                // Progress feed: the honest empty-render terminal (before the
+                // caller maps it to TAB_EMPTY / try-next semantics).
+                onProgress("render_blank", JSONObject())
+                completeFetch(finished, future) {
                     it.completeExceptionally(
-                        IllegalStateException("the page rendered no readable content"),
+                        IllegalStateException(TAB_EMPTY_MSG),
                     )
                 }
                 return@evaluateJavascript
@@ -641,42 +814,27 @@ class WebViewPageFetcher(context: Context) {
             val errReason = errorPageReason(json.optString("title", ""), text)
             if (errReason != null) {
                 Log.w(TAG, "FC: [InternetPlugin] webview error-page extract blocked: $errReason")
-                completeFetch(webView, future, finished) {
-                    it.completeExceptionally(IllegalStateException(errReason))
-                }
+                completeFetch(finished, future) { it.completeExceptionally(IllegalStateException(errReason)) }
                 return@evaluateJavascript
             }
             Log.d(TAG, "FC: [InternetPlugin] webview extracted ${text.length} chars, title=${json.optString("title", "").take(80)}")
             Log.d(TAG, "FC: [InternetPlugin] webview text preview: ${text.take(200)}")
-            completeFetch(webView, future, finished) { it.complete(parsed) }
+            // Progress feed: the settled extract's SIZE only (display fact).
+            onProgress("extracted", JSONObject().put("chars", text.length))
+            completeFetch(finished, future) { it.complete(parsed) }
         }
     }
 
     /** One-shot terminal completion: exactly one caller wins the CAS and
-     *  completes the future; the renderer is torn down either way (it is no
-     *  longer needed once the fetch is decided). */
+     *  completes the future. The TAB WebView is left alive (visible). */
     private fun <R> completeFetch(
-        webView: WebView,
-        future: CompletableFuture<R>,
         finished: AtomicBoolean,
+        future: CompletableFuture<R>,
         completion: (CompletableFuture<R>) -> Unit,
     ) {
-        val won = finished.compareAndSet(false, true)
-        destroyWebView(webView)
-        currentWebView = null
-        if (won) {
-            busy.set(false)
-            completion(future)
-        }
-    }
-
-    /** WebView.destroy() must run on the thread that created it. */
-    private fun destroyWebView(webView: WebView) {
-        try {
-            webView.stopLoading()
-            webView.destroy()
-        } catch (e: Exception) {
-            Log.w(TAG, "FC: [InternetPlugin] webview destroy failed: $e")
-        }
+        if (!finished.compareAndSet(false, true)) return
+        synchronized(pending) { pending.remove(future) }
+        busy.set(false)
+        completion(future)
     }
 }

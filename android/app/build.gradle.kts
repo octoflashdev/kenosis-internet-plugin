@@ -91,21 +91,35 @@ kotlin {
 }
 
 dependencies {
-    // Phase-1.5 browser_fetch engine: fast path = plain HTTP fetch + HTML→text,
-    // fallback = hidden OS-WebView render (android.webkit — platform, no dep).
-    // OkHttp (Apache-2.0) + jsoup (MIT) — both license-clean for the APK
-    // (see the license review; no GPL in the APK).
-    // Phase 2 replaces this with a future headless browser (JNI .so).
+    // Tier-ladder web fetch (plan: anonymous-first-tiered-web-fetch — this
+    // supersedes the earlier "no parallel HTTP/HTML client / WYSIWYG only"
+    // comment, explicitly and with the user's sign-off). The ladder is
+    //   - Tier 1  anonymous HTTPS GET with a truthful product UA over plain
+    //     text extraction (OkHttp + Jsoup, Apache-2.0 / MIT) — what any
+    //     reading client does; a page readable this way needs no browser.
+    //   - Tier 2+ the VISIBLE WebView tab (android.webkit — platform, no dep):
+    //     every non-Tier-1 read renders in the tab the user can see, and the
+    //     model reads what it displays.
+    // Engine URLs are WebView-only — always were, still are: WebFetchTiers
+    // routes them straight to the tab via the shared TabManager.isEngineUrl
+    // predicate and the anonymous client NEVER touches an engine host (the
+    // test/sanity/internet_plugin_tab_browser_test.dart guard pins both
+    // directions). No UA stripping or spoofing, no bot-wall bypass, no
+    // consent auto-clicking — captcha and login walls stay human-in-the-loop
+    // in the visible tab.
+
+    // Tier 1 (anonymous fetch + server-HTML text extraction).
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jsoup:jsoup:1.18.1")
 
-    // Local unit tests (e.g. InternetPluginService.shouldFallback boundary).
-    // Run on the dev machine: cd plugins/internet/android && ./gradlew :app:testDebugUnitTest
+    // Local unit tests (TabManager / pick / captcha-marker / fetch-log /
+    // tier-ladder pins). Run on the dev machine:
+    // cd plugins/internet/android && ./gradlew :app:testDebugUnitTest
     // (NOT on the build server — too slow; same policy as the host app's tests).
     testImplementation("junit:junit:4.13.2")
     // The real org.json (android.jar's copy is a "not mocked" stub in local
-    // unit tests) — needed by the Qwant SERP-parser tests (+73). Test-only:
-    // the APK keeps the platform's android-runtime org.json.
+    // unit tests) — needed by the fetch-log JSON pins. Test-only: the APK
+    // keeps the platform's android-runtime org.json.
     testImplementation("org.json:json:20240303")
 }
 
