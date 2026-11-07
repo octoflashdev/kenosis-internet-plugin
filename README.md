@@ -2,6 +2,8 @@
 
 The network plugin for **[Kenosis AI](https://play.google.com/store/apps/details?id=hr.exel.kenosis_ai)** — an offline-first, on-device AI assistant.
 
+Website: https://www.kenosis-ai.com/plugins.html
+
 ## What this is
 
 Kenosis AI has **no `INTERNET` permission** — the host app cannot touch the
